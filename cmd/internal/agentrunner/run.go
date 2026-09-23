@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"uuid"
 
@@ -100,9 +101,14 @@ type sessionObserver struct {
 	sessionID session.ID
 	output    io.Writer
 	cancel    context.CancelFunc
+	// partials is set when the request enables include_partial_messages. It writes to stdout only,
+	// never to the session log.
+	partials *partialStream
 
 	mu  sync.Mutex
 	err error
+	// failed mirrors err so Err does not wait for mu, which a blocked partial write may hold at shutdown.
+	failed atomic.Pointer[error]
 }
 
 func RunMain(
@@ -426,6 +432,13 @@ func Run(
 		output:    observedOutput,
 		cancel:    cancel,
 	}
+	coordinatorContext := runContext
+	if parsed.IncludePartialMessages != nil && *parsed.IncludePartialMessages {
+		observer.partials = newPartialStream(output)
+		observer.partials.start(observer.flushPartials)
+		defer observer.closePartials()
+		coordinatorContext = llm.WithPartialSink(runContext, observer.partials.Send)
+	}
 	observerID := store.AddObserver(observer.Observe)
 	defer store.RemoveObserver(observerID)
 	current := coordinator.New(coordinator.Dependencies{
@@ -439,7 +452,9 @@ func Run(
 		Tools:                 registry,
 		Operations:            operations,
 	})
-	coordinatorErr := current.Run(runContext)
+	coordinatorErr := current.Run(coordinatorContext)
+	// Model requests are canceled but not joined by the coordinator; stop partials before any further output.
+	observer.closePartials()
 	if observerErr := observer.Err(); observerErr != nil {
 		return observerErr
 	}
@@ -693,6 +708,13 @@ func (observer *sessionObserver) Observe(sessionID session.ID, item sessionstore
 	if observer.err != nil {
 		return
 	}
+	if observer.partials != nil {
+		// Partials reported before this item (for example the deltas of this model_response) come first.
+		if err := observer.partials.drain(); err != nil {
+			observer.fail(err)
+			return
+		}
+	}
 	if err := writeSessionItem(observer.output, item); err != nil {
 		observer.fail(err)
 		return
@@ -710,13 +732,37 @@ func writeSessionItem(output io.Writer, item sessionstore.Item) error {
 	return nil
 }
 
+func (observer *sessionObserver) flushPartials() {
+	observer.mu.Lock()
+	defer observer.mu.Unlock()
+	if observer.err != nil {
+		return
+	}
+	if err := observer.partials.drain(); err != nil {
+		observer.fail(err)
+	}
+}
+
+// closePartials stops accepting partials and flushes what is queued. If a write is blocked because the
+// consumer stopped reading stdout, it gives up after partialShutdownGrace. Safe to call more than once.
+func (observer *sessionObserver) closePartials() {
+	if observer.partials == nil {
+		return
+	}
+	if observer.partials.Close() {
+		observer.flushPartials()
+	}
+}
+
 func (observer *sessionObserver) fail(err error) {
 	observer.err = err
+	observer.failed.Store(&err)
 	observer.cancel()
 }
 
 func (observer *sessionObserver) Err() error {
-	observer.mu.Lock()
-	defer observer.mu.Unlock()
-	return observer.err
+	if err := observer.failed.Load(); err != nil {
+		return *err
+	}
+	return nil
 }

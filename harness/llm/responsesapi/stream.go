@@ -12,10 +12,15 @@ import (
 	"math/rand/v2"
 	"net/http"
 	"slices"
+	"sync/atomic"
 	"time"
 
+	"github.com/unreallabsai/unreal-agent/harness/llm"
 	"github.com/unreallabsai/unreal-agent/harness/primitives"
 )
+
+// partialAttempts numbers request attempts for llm.Partial.Attempt.
+var partialAttempts atomic.Uint64
 
 func (adapter *adapter) exchange(ctx context.Context, body []byte, cacheKey string) (int, []byte, error) {
 	events := make(chan primitives.PrimitiveEvent)
@@ -63,6 +68,18 @@ func (adapter *adapter) exchangeAttempt(ctx context.Context, request primitives.
 	adapter.remote.SendRequest(ctx, request, events)
 	var result responseAttempt
 	var state responseState
+	if sink := llm.PartialSinkFrom(ctx); sink != nil {
+		attempt := partialAttempts.Add(1)
+		state.partial = func(partial llm.Partial) {
+			// Best effort only: a partial racing cancellation is discarded by the sink using Attempt.
+			if ctx.Err() == nil {
+				partial.Attempt = attempt
+				sink(partial)
+			}
+		}
+		// Each attempt starts a fresh preview, so deltas from a failed attempt are discarded.
+		state.partial(llm.Partial{Kind: llm.PartialReset})
+	}
 	var streaming bool
 	var parseErr error
 	for {
@@ -140,6 +157,7 @@ type responseState struct {
 	items    map[int]jsontext.Value
 	failure  *APIError
 	err      error
+	partial  llm.PartialSink
 }
 
 func (state *responseState) observe(data []byte) error {
@@ -151,6 +169,8 @@ func (state *responseState) observe(data []byte) error {
 		Response    jsontext.Value `json:"response"`
 		Item        jsontext.Value `json:"item"`
 		OutputIndex *int           `json:"output_index"`
+		ItemID      string         `json:"item_id"`
+		Delta       string         `json:"delta"`
 		Code        string         `json:"code"`
 		Message     string         `json:"message"`
 		Param       string         `json:"param"`
@@ -163,6 +183,14 @@ func (state *responseState) observe(data []byte) error {
 	}
 	if err := json.Unmarshal(data, &event); err != nil {
 		return fmt.Errorf("invalid Responses stream event JSON: %w", err)
+	}
+	if state.partial != nil && event.Delta != "" {
+		switch event.Type {
+		case "response.output_text.delta":
+			state.partial(llm.Partial{Kind: llm.PartialText, ItemID: event.ItemID, Delta: event.Delta})
+		case "response.reasoning_summary_text.delta":
+			state.partial(llm.Partial{Kind: llm.PartialReasoning, ItemID: event.ItemID, Delta: event.Delta})
+		}
 	}
 	if event.Type == "response.completed" || event.Type == "response.failed" || event.Type == "response.incomplete" {
 		state.terminal = true

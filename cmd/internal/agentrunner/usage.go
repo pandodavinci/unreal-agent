@@ -25,7 +25,18 @@ Request schema (JSON object; unknown fields are rejected):
   disallowed_tools: array of non-empty strings (optional)
     Static tool names excluded from model context and execution.
   extra_allowed_tools: array of non-empty strings (optional; accepted but ignored)
-  include_partial_messages: boolean (optional; accepted but ignored)
+  include_partial_messages: boolean (optional; default false)
+    Also write ephemeral preview lines to stdout while a model response streams:
+      {"type":"partial","kind":"reset"}
+      {"type":"partial","kind":"text","item_id":"msg_...","delta":"Hel"}
+      {"type":"partial","kind":"reasoning","item_id":"rs_...","delta":"Checking"}
+    item_id is the provider's output item ID; concatenate deltas per item_id. "reasoning" carries
+    reasoning summary text only. A reset precedes every request attempt (each model turn and each
+    retry) and discards the preview so far; it is also sent if previews had to be dropped because
+    stdout could not keep up. The preview is retired by the model_response session item, which is
+    written after the partials it supersedes and is authoritative, or by the run ending on error or
+    cancellation. Partials are never written to the session store or the JSONL log. They add output
+    volume, so keep reading stdout: an unread pipe fills sooner than without partials.
 `
 
 func writeUsage(flags *flag.FlagSet) error {
