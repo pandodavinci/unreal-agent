@@ -38,6 +38,23 @@ unreal-agent-runner '{"prompt":"Summarize this project."}'
 unreal-agent-runner < request.json
 ```
 
+To message the agent while it works, set `stream_input` and keep writing user
+messages to stdin, one JSON object per line. The request must be the first line:
+
+```sh
+{
+  echo '{"prompt":"Run the tests and fix what fails.","stream_input":true}'
+  sleep 30
+  echo '{"role":"user","content":"Skip the slow e2e suite.","message_id":"7f9c1f1e-6a1b-4a53-9a4c-2b6f5d0e8c11"}'
+} | unreal-agent-runner
+```
+
+Each message reaches the model at its next turn, even while commands are still
+running. The run still ends when the agent is idle. A message is delivered once
+its input item appears on stdout; if the run ends first, send it again in the
+next run with the same `message_id` (repeated IDs are ignored). Invalid lines
+are reported as `{"type":"input_error",...}` events and skipped.
+
 OpenAI is the default provider. Set `UNREAL_HARNESS_LLM_PROVIDER` to `openai`,
 `openai-codex`, `openrouter`, `fireworks`, or `ollama`, and
 `UNREAL_HARNESS_LLM_MODEL` to choose a model.

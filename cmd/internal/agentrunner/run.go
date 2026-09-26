@@ -1,6 +1,7 @@
 package agentrunner
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json/v2"
@@ -72,6 +73,7 @@ type Request struct {
 	SessionID              *string          `json:"session_id"`
 	ThinkingLevel          string           `json:"thinking_level"`
 	IncludePartialMessages *bool            `json:"include_partial_messages"`
+	StreamInput            *bool            `json:"stream_input"`
 	ExtraAllowedTools      []string         `json:"extra_allowed_tools"`
 	DisallowedTools        []string         `json:"disallowed_tools"`
 }
@@ -100,13 +102,18 @@ type errorEvent struct {
 type sessionObserver struct {
 	sessionID session.ID
 	output    io.Writer
-	cancel    context.CancelFunc
+	// stdout receives input_error events, which are not session items and so skip the JSONL log.
+	stdout io.Writer
+	cancel context.CancelFunc
 	// partials is set when the request enables include_partial_messages. It writes to stdout only,
 	// never to the session log.
 	partials *partialStream
 
 	mu  sync.Mutex
 	err error
+	// finished is set once the coordinator returns; later input_error events are dropped. It is atomic so
+	// setting it does not wait for mu, which a blocked partial write may hold at shutdown.
+	finished atomic.Bool
 	// failed mirrors err so Err does not wait for mu, which a blocked partial write may hold at shutdown.
 	failed atomic.Pointer[error]
 }
@@ -197,6 +204,10 @@ func Run(
 		return errors.New("tool heartbeat interval must not be negative")
 	}
 
+	requestInput := input
+	// streamedInput holds the stdin lines after the request when the request enables stream_input.
+	var streamedInput *bufio.Reader
+	firstStreamedLine := 1
 	if prompt != nil {
 		encoded, err := json.Marshal(struct {
 			Prompt string `json:"prompt"`
@@ -204,11 +215,15 @@ func Run(
 		if err != nil {
 			return fmt.Errorf("encode prompt request: %w", err)
 		}
-		input = bytes.NewReader(encoded)
+		requestInput = bytes.NewReader(encoded)
 	} else if flags.NArg() == 1 {
-		input = strings.NewReader(flags.Arg(0))
+		requestInput = strings.NewReader(flags.Arg(0))
+		streamedInput = bufio.NewReader(input)
+	} else {
+		requestInput, streamedInput = splitRequestLine(input)
+		firstStreamedLine = 2
 	}
-	parsed, newTools, err := config.ParseRequest(input)
+	parsed, newTools, err := config.ParseRequest(requestInput)
 	if err != nil {
 		return err
 	}
@@ -218,6 +233,10 @@ func Run(
 	messages, err := validateRequest(parsed)
 	if err != nil {
 		return err
+	}
+	streaming := parsed.StreamInput != nil && *parsed.StreamInput
+	if streaming && streamedInput == nil {
+		return errors.New("stream_input requires the JSON request on the first stdin line")
 	}
 	workspace, err := filepath.Abs(strings.TrimSpace(*workspaceDirectory))
 	if err != nil {
@@ -386,19 +405,11 @@ func Run(
 		return fmt.Errorf("submit settings: %w", err)
 	}
 	for index, message := range messages {
-		payload, err := json.Marshal(message.Content)
+		input, err := messageInput(message)
 		if err != nil {
 			return fmt.Errorf("encode message %d: %w", index, err)
 		}
-		var messageID inbox.ID
-		if message.MessageID != nil {
-			messageID = inbox.ID(strings.TrimSpace(*message.MessageID))
-		} else {
-			messageID = inbox.ID(uuid.New().String())
-		}
-		if err := inputs.Submit(runContext, inbox.Input{
-			ID: messageID, Kind: inbox.InputExternal, Payload: payload,
-		}); err != nil {
+		if err := inputs.Submit(runContext, input); err != nil {
 			return fmt.Errorf("submit message %d: %w", index, err)
 		}
 	}
@@ -430,6 +441,7 @@ func Run(
 	observer := &sessionObserver{
 		sessionID: sessionID,
 		output:    observedOutput,
+		stdout:    output,
 		cancel:    cancel,
 	}
 	coordinatorContext := runContext
@@ -452,7 +464,12 @@ func Run(
 		Tools:                 registry,
 		Operations:            operations,
 	})
+	if streaming {
+		// The reader may stay blocked on stdin after the run ends; the process exit releases it.
+		go observer.readStreamedInput(runContext, streamedInput, firstStreamedLine, inputs)
+	}
 	coordinatorErr := current.Run(coordinatorContext)
+	observer.finished.Store(true)
 	// Model requests are canceled but not joined by the coordinator; stop partials before any further output.
 	observer.closePartials()
 	if observerErr := observer.Err(); observerErr != nil {
@@ -646,19 +663,39 @@ func validateRequest(parsed Request) ([]RequestMessage, error) {
 		return nil, errors.New("messages must not be empty")
 	}
 	for index, message := range parsed.Messages {
-		if message.Role != "" && message.Role != "user" {
-			return nil, fmt.Errorf("messages[%d].role must be user", index)
-		}
-		if message.MessageID != nil && strings.TrimSpace(*message.MessageID) == "" {
-			return nil, fmt.Errorf("messages[%d].message_id must not be empty", index)
-		}
-		if message.MessageID != nil {
-			if _, err := uuid.Parse(strings.TrimSpace(*message.MessageID)); err != nil {
-				return nil, fmt.Errorf("messages[%d].message_id must be a UUID", index)
-			}
+		if err := validateMessage(fmt.Sprintf("messages[%d]", index), message); err != nil {
+			return nil, err
 		}
 	}
 	return parsed.Messages, nil
+}
+
+func validateMessage(name string, message RequestMessage) error {
+	if message.Role != "" && message.Role != "user" {
+		return fmt.Errorf("%s.role must be user", name)
+	}
+	if message.MessageID != nil && strings.TrimSpace(*message.MessageID) == "" {
+		return fmt.Errorf("%s.message_id must not be empty", name)
+	}
+	if message.MessageID != nil {
+		if _, err := uuid.Parse(strings.TrimSpace(*message.MessageID)); err != nil {
+			return fmt.Errorf("%s.message_id must be a UUID", name)
+		}
+	}
+	return nil
+}
+
+// messageInput converts a validated user message to an inbox input, generating an ID when none is given.
+func messageInput(message RequestMessage) (inbox.Input, error) {
+	payload, err := json.Marshal(message.Content)
+	if err != nil {
+		return inbox.Input{}, err
+	}
+	messageID := inbox.ID(uuid.New().String())
+	if message.MessageID != nil {
+		messageID = inbox.ID(strings.TrimSpace(*message.MessageID))
+	}
+	return inbox.Input{ID: messageID, Kind: inbox.InputExternal, Payload: payload}, nil
 }
 
 func reasoningEffort(level string) llm.ReasoningEffort {
